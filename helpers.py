@@ -10,8 +10,10 @@ from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
 
 import config
-from models import db, User, Patient, XRay, Appointment, Prescription
-
+from models import db, User, Patient, XRay, Appointment, Prescription, Invoice, Payment
+from sqlalchemy import func, extract, and_, desc
+from collections import defaultdict
+import re
 # --- 全局变量与初始化 ---
 os.makedirs(config.UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(config.CHAT_LOGS_FOLDER, exist_ok=True)
@@ -320,38 +322,49 @@ def save_chat_history(username, role, history):
         json.dump(history_to_save, f, indent=2, ensure_ascii=False)
 
 def format_medical_record_for_ai(patient):
-    """将患者的病历信息格式化为一段提供给大模型的上下文"""
+    """
+    【已优化】将患者病历格式化为一段更简洁、更结构化的AI上下文。
+    """
     if not patient:
         return ""
     
-    record = [f"你是一位专业的AI牙科医生，现在需要你根据以下患者的病历信息进行分析和回答。请使用友好、专业且易于理解的语言。"]
-    record.append("\n--- 患者基本信息 ---")
-    record.append(f"姓名: {patient.name}")
-    if patient.gender: record.append(f"性别: {patient.gender}")
-    if patient.dob: record.append(f"出生日期: {patient.dob}")
-    if patient.contact: record.append(f"联系方式: {patient.contact}")
+    # 简介和指令
+    prompt = [
+        "你是一位专业的AI牙科医生助理。请根据以下患者病历的关键信息，用专业、简洁、易于理解的语言回答问题。",
+        "---",
+        f"患者姓名: {patient.name}"
+    ]
     
-    record.append("\n--- 病历详情 ---")
-    if patient.chief_complaint: record.append(f"主诉: {patient.chief_complaint}")
-    if patient.present_illness: record.append(f"现病史: {patient.present_illness}")
-    if patient.past_history: record.append(f"既往史: {patient.past_history}")
-    if patient.examination_info: record.append(f"检查: {patient.examination_info}")
-    if patient.differential_diagnosis: record.append(f"鉴别诊断: {patient.differential_diagnosis}")
-    if patient.treatment_plan: record.append(f"治疗计划: {patient.treatment_plan}")
-
+    # 病历关键信息
+    key_info = {
+        "主诉": patient.chief_complaint,
+        "现病史": patient.present_illness,
+        "检查信息": patient.examination_info,
+        "治疗计划": patient.treatment_plan
+    }
+    for key, value in key_info.items():
+        if value: # 只添加有内容的字段
+            prompt.append(f"*{key}*: {value}")
+            
+    # AI分析摘要
     if patient.xrays.all():
-        record.append("\n--- X光片AI分析摘要 ---")
+        prompt.append("\n*相关影像AI分析摘要*:")
+        findings_summary = []
         for xray in patient.xrays:
-            findings = [f"{Chinese_Name_Mapping.get(res['class_name'], res['class_name'])} (置信度: {res['confidence']:.2f})" for res in xray.ai_results]
+            findings = [f"{Chinese_Name_Mapping.get(res['class_name'], res['class_name'])}" for res in xray.ai_results]
             if findings:
-                record.append(f"于 {xray.upload_date} 上传的X光片中发现: {', '.join(findings)}。")
-            else:
-                record.append(f"于 {xray.upload_date} 上传的X光片中未发现明显异常。")
+                # 使用 set 去重，避免 "龋齿, 龋齿" 这样的重复
+                unique_findings = ", ".join(sorted(list(set(findings))))
+                findings_summary.append(f"一份X光片显示存在: {unique_findings}")
+        
+        if findings_summary:
+            prompt.extend(findings_summary)
+        else:
+            prompt.append("影像中未发现明显龋齿或根尖周病变。")
+
+    prompt.append("---\n请基于以上信息回答。")
     
-    record.append("\n--- 指令 ---")
-    record.append("请基于以上信息，回答用户接下来的问题。")
-    
-    return "\n".join(record)
+    return "\n".join(prompt)
 
 
 def get_deepseek_response_stream(messages, model="deepseek-chat"):
@@ -361,8 +374,14 @@ def get_deepseek_response_stream(messages, model="deepseek-chat"):
         return
 
     # 过滤掉自定义的 is_context 字段
-    api_messages = [{k: v for k, v in msg.items() if k != 'is_context'} for msg in messages]
-
+    api_messages = [msg for msg in messages if not msg.get('is_context')]
+    # 调试打印代码
+    print("="*50)
+    print("即将发送给 DeepSeek API 的最终数据:")
+    # 使用json.dumps美化输出，方便查看
+    print(json.dumps(api_messages, indent=2, ensure_ascii=False))
+    print("="*50)
+    
     try:
         response_stream = deepseek_client.chat.completions.create(
             model=model,
@@ -535,3 +554,202 @@ def generate_patient_record_csv(patient):
     df.to_csv(output, index=False, encoding='utf-8-sig')
     
     return output.getvalue()
+
+#远程设备图片识别
+def format_ai_results_for_display(ai_results):
+    """
+    将YOLO模型的原始分析结果格式化为一段人类可读的文本。
+    """
+    if not ai_results:
+        return "分析完成，未在图像中检测到明显的病变区域。"
+
+    # 假设 ai_results 是一个列表，每个元素是一个字典，如: {'box': [...], 'name': 'Caries', 'confidence': 0.85}
+    caries_count = 0
+    periapical_lesion_count = 0
+    
+    for result in ai_results:
+        # 【关键修正】使用您在训练时定义的大小写完全一致的类别名
+        if result.get('name') == 'Caries': 
+            caries_count += 1
+        elif result.get('name') == 'Periapical lesion': 
+            periapical_lesion_count += 1
+            
+    # 您可以根据自己的需求，设计更丰富的文本描述
+    report_parts = []
+    if caries_count > 0:
+        report_parts.append(f"检测到 {caries_count} 处疑似【龋齿】区域")
+    if periapical_lesion_count > 0:
+        report_parts.append(f"检测到 {periapical_lesion_count} 处疑似【根尖周病变】区域")
+        
+    if not report_parts:
+        return "分析完成，图像中未发现龋齿或根尖周病变。"
+        
+    return "AI分析概要：" + "；".join(report_parts) + "。提醒：AI分析结果仅供参考，最终诊断请以执业医师意见为准。"
+
+# 医生数据报表提供统计数据的函数
+def get_doctor_report_data(doctor_id):
+    """
+    【全新】为医生数据报表页面，聚合所需的全部统计数据。
+    """
+    today = datetime.date.today()
+    
+    # --- 1. 统计过去6个月，每个月的新增患者数量 ---
+    six_months_ago = today - datetime.timedelta(days=180)
+    monthly_new_patients_raw = db.session.query(
+        extract('year', Patient.creation_date).label('year'),
+        extract('month', Patient.creation_date).label('month'),
+        func.count(Patient.id)
+    ).filter(
+        Patient.doctor_id == doctor_id,
+        Patient.creation_date >= six_months_ago
+    ).group_by('year', 'month').order_by('year', 'month').all()
+    
+    # 格式化数据以供Chart.js使用
+    monthly_labels = [(today - datetime.timedelta(days=30*i)).strftime("%Y-%m") for i in range(5, -1, -1)]
+    monthly_patient_data = {f"{r.year}-{r.month:02d}": r[2] for r in monthly_new_patients_raw}
+    monthly_patient_counts = [monthly_patient_data.get(label, 0) for label in monthly_labels]
+    
+    # --- 2. 统计所有患者病历中，“鉴别诊断”字段的关键词分布 ---
+    # 注意：这是一个基于文本匹配的简单统计，结果的准确性依赖于病历记录的规范性。
+    diagnosis_keywords = ['龋齿', '牙髓炎', '根尖周炎', '牙周炎', '牙龈炎', '智齿', '缺损', '创伤']
+    diagnosis_counts = {key: 0 for key in diagnosis_keywords}
+    
+    patients = Patient.query.filter_by(doctor_id=doctor_id).all()
+    for patient in patients:
+        if patient.differential_diagnosis:
+            # 使用集合确保一位患者的同一诊断只被记一次
+            found_in_patient = set()
+            for keyword in diagnosis_keywords:
+                if keyword in patient.differential_diagnosis:
+                    found_in_patient.add(keyword)
+            for keyword in found_in_patient:
+                diagnosis_counts[keyword] += 1
+                
+    # 过滤掉数量为0的诊断，让图表更整洁
+    filtered_diagnosis_counts = {k: v for k, v in diagnosis_counts.items() if v > 0}
+
+    # --- 3. 统计过去6个月，每个月的账单总金额 ---
+    monthly_revenue_raw = db.session.query(
+        extract('year', Invoice.issue_date).label('year'),
+        extract('month', Invoice.issue_date).label('month'),
+        func.sum(Invoice.total_amount)
+    ).join(Patient).filter(
+        Patient.doctor_id == doctor_id,
+        Invoice.issue_date >= six_months_ago
+    ).group_by('year', 'month').order_by('year', 'month').all()
+    
+    monthly_revenue_data = {f"{r.year}-{r.month:02d}": r[2] for r in monthly_revenue_raw}
+    monthly_revenue_sums = [float(monthly_revenue_data.get(label, 0)) for label in monthly_labels]
+
+    # --- 4. 将所有数据打包返回 ---
+    return {
+        'monthly_new_patients': {
+            'labels': monthly_labels,
+            'data': monthly_patient_counts
+        },
+        'diagnosis_distribution': filtered_diagnosis_counts,
+        'monthly_revenue': {
+            'labels': monthly_labels,
+            'data': monthly_revenue_sums
+        }
+    }
+
+# --- 营业额 ---
+def get_financial_report_data(doctor_id, start_date_str, end_date_str, search_query):
+    """
+    【全新】为财务报表页面聚合所需的全部数据。
+    """
+    # --- 1. 构建基础查询，关联Invoice和Patient ---
+    base_query = db.session.query(Invoice).join(Patient).filter(Patient.doctor_id == doctor_id)
+
+    # --- 2. 根据时间范围进行筛选 ---
+    total_revenue = 0
+    start_date, end_date = None, None
+    if start_date_str and end_date_str:
+        try:
+            start_date = datetime.datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            end_date = datetime.datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            base_query = base_query.filter(and_(
+                func.date(Invoice.issue_date) >= start_date,
+                func.date(Invoice.issue_date) <= end_date
+            ))
+        except ValueError:
+            # 如果日期格式错误，则忽略时间筛选
+            pass
+
+    # 在计算总额前，先应用时间过滤器
+    if start_date and end_date:
+        # scalar()用于查询单个值，如果结果为空则返回None
+        total_revenue = db.session.query(func.sum(Invoice.total_amount)).select_from(base_query.subquery()).scalar() or 0
+    else:
+        # 如果没有指定时间，则计算所有时间的总额
+        total_revenue = db.session.query(func.sum(Invoice.total_amount)).filter(Invoice.patient.has(doctor_id=doctor_id)).scalar() or 0
+
+    # --- 3. 根据患者姓名进行搜索筛选 ---
+    if search_query:
+        base_query = base_query.filter(Patient.name.ilike(f'%{search_query}%'))
+        
+    # --- 4. 查询所有符合条件的账单，并按月份分组 ---
+    all_invoices = base_query.order_by(desc(Invoice.issue_date)).all()
+    
+    invoices_by_month = defaultdict(list)
+    for invoice in all_invoices:
+        month_key = invoice.issue_date.strftime('%Y年%m月')
+        # 将完整的账单信息和患者姓名打包
+        invoices_by_month[month_key].append({
+            'id': invoice.id,
+            'issue_date': invoice.issue_date.strftime('%Y-%m-%d'),
+            'patient_name': invoice.patient.name,
+            'total_amount': invoice.total_amount,
+            'paid_amount': invoice.paid_amount,
+            'status': invoice.status
+        })
+
+    # --- 5. 将所有数据打包返回给前端 ---
+    return {
+        'total_revenue': total_revenue,
+        'invoices_by_month': invoices_by_month,
+        'search_query': search_query,
+        'start_date': start_date_str,
+        'end_date': end_date_str
+    }
+
+def record_payment_for_invoice(invoice_id, amount, method, notes):
+    """
+    为指定账单记录一笔新的付款，并更新账单状态。
+    """
+    invoice = Invoice.query.get(invoice_id)
+    if not invoice:
+        return False, "找不到该账单。"
+
+    # 检查是否超额支付
+    balance_due = invoice.total_amount - invoice.paid_amount
+    if amount > balance_due:
+        return False, f"付款金额 (¥{amount:.2f}) 不能超过未付金额 (¥{balance_due:.2f})。"
+
+    try:
+        # 1. 创建一条新的付款记录
+        new_payment = Payment(
+            invoice_id=invoice.id,
+            amount=amount,
+            method=method,
+            notes=notes
+        )
+        db.session.add(new_payment)
+        
+        # 2. 更新账单的“已付金额”
+        invoice.paid_amount += amount
+        
+        # 3. 根据付款情况，自动更新账单状态
+        if invoice.paid_amount >= invoice.total_amount:
+            invoice.status = '已付清'
+        else:
+            invoice.status = '部分支付'
+            
+        db.session.commit()
+        return True, f"成功为账单 #{invoice.id} 记录一笔 ¥{amount:.2f} 的付款。"
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"记录付款时出错: {e}")
+        return False, "记录付款时发生服务器内部错误。"

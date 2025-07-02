@@ -45,6 +45,8 @@ class Patient(db.Model):
     differential_diagnosis = db.Column(db.Text) # 鉴别诊断
     treatment_plan = db.Column(db.Text) # 治疗计划
     
+    # 创建日期字段
+    creation_date = db.Column(db.DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc))
     # --- JSON格式存储的动态数据 ---
     chat_history_json = db.Column(db.Text, name='chat_history') # 与AI的聊天记录
     dental_chart_json = db.Column(db.Text, name='dental_chart') # 牙位图标记数据
@@ -71,13 +73,14 @@ class Patient(db.Model):
     xrays = db.relationship('XRay', backref='patient', lazy='dynamic', cascade="all, delete-orphan")
     appointments = db.relationship('Appointment', backref='patient', lazy='dynamic', cascade="all, delete-orphan")
     prescriptions = db.relationship('Prescription', backref='patient', lazy='dynamic', cascade="all, delete-orphan")
+    invoices = db.relationship('Invoice', backref='patient', lazy='dynamic', cascade="all, delete-orphan")
 
 # 在 models.py 中
 class XRay(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     filename = db.Column(db.String(200), nullable=False)
     # 这里没有 overlay_filename 字段
-    upload_date = db.Column(db.String(50), nullable=False)
+    upload_date = db.Column(db.DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc))
     ai_results_json = db.Column(db.Text, name='ai_results')
     
     @property
@@ -117,3 +120,45 @@ class Prescription(db.Model):
     @medications.setter
     def medications(self, meds_list):
         self.medications_json = json.dumps(meds_list, ensure_ascii=False)
+# --- 计费功能 ---
+class ServiceItem(db.Model):
+    """服务项目模型：存储诊所提供的所有可计费服务及其标准价格"""
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False, unique=True)
+    description = db.Column(db.Text, nullable=True)
+    price = db.Column(db.Float, nullable=False)
+
+class Invoice(db.Model):
+    """账单模型：代表一张开具给患者的账单"""
+    id = db.Column(db.Integer, primary_key=True)
+    issue_date = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+    due_date = db.Column(db.DateTime, nullable=True)
+    total_amount = db.Column(db.Float, nullable=False)
+    paid_amount = db.Column(db.Float, nullable=False, default=0.0)
+    status = db.Column(db.String(30), nullable=False, default='未支付') # 例如: '未支付', '部分支付', '已付清', '已逾期'
+    
+    patient_id = db.Column(db.Integer, db.ForeignKey('patient.id'), nullable=False)
+    
+    # 关系：一张账单包含多个账单条目
+    items = db.relationship('InvoiceItem', backref='invoice', lazy=True, cascade="all, delete-orphan")
+    # 关系：一张账单可以有多条付款记录
+    payments = db.relationship('Payment', backref='invoice', lazy=True, cascade="all, delete-orphan")
+
+class InvoiceItem(db.Model):
+    """账单条目模型：代表账单中的每一行服务项目"""
+    id = db.Column(db.Integer, primary_key=True)
+    service_name = db.Column(db.String(150), nullable=False)
+    quantity = db.Column(db.Integer, nullable=False, default=1)
+    unit_price = db.Column(db.Float, nullable=False) # 记录开单时的价格，以防服务标准价格变动
+    
+    invoice_id = db.Column(db.Integer, db.ForeignKey('invoice.id'), nullable=False)
+
+class Payment(db.Model):
+    """付款记录模型：记录针对某张账单的每一次付款"""
+    id = db.Column(db.Integer, primary_key=True)
+    payment_date = db.Column(db.DateTime, nullable=False, default=datetime.datetime.utcnow)
+    amount = db.Column(db.Float, nullable=False)
+    method = db.Column(db.String(50), nullable=True) # 例如: '现金', '刷卡', '微信支付', '支付宝'
+    notes = db.Column(db.Text, nullable=True)
+    
+    invoice_id = db.Column(db.Integer, db.ForeignKey('invoice.id'), nullable=False)
